@@ -1,0 +1,125 @@
+###############
+# Environment #
+###############
+
+# Name of the pipeline runs that get generated
+name: DRYRunWorkspace--$(Date:yyyyMMdd)$(Rev:.r)--TYPE ${{ parameters.PlanExecute }}--ENV ${{ parameters.Workspace }}
+
+trigger:
+- none
+
+parameters:
+- name: PlanExecute
+  displayName: 'Create, Evaluate or Destroy the resources?'
+  type: string
+  default: 'Evaluate'
+  values: 
+  - Create
+  - Evaluate
+  - Destroy
+- name: Workspace
+  displayName: 'What is the Environment?'
+  type: string
+  default: 'dev' 
+  values: 
+  - dev # TF Apply run against the selected repo
+  - prod # TF Destroy run against the selected repo
+
+variables:
+# Groups
+- group: KvSecrets
+- group: Terraform-Backend
+# Individual Variables
+- name: backendkey
+  value: '03-Deployment-DRY-Run-using-Workspaces/terraform.state'
+- name: env # workspace is also the environment concat for tf resources (so dont conflict if both exist)
+  value: ${{ parameters.Workspace }}
+- name: repo # Set location of tf files here
+  value: $(System.DefaultWorkingDirectory)/03-Deployment-DRY-Run-using-Workspaces/TF-Files
+- name: initBackendConfigSettings # Store terraform init backend config data below to keep code DRY
+  value: >
+    -backend-config=resource_group_name=$(var-backend-resource-group-name)
+    -backend-config=storage_account_name=$(var-backend-storage-account-name)
+    -backend-config=container_name=$(var-backend-container-name)
+    -backend-config=key=$(backendkey)
+    -backend-config=subscription_id=$(var-backend-subscription-id)
+    -backend-config=use_oidc=true
+- name: tfvars # Store terraform authN variables here that tfplan will ingest to keep code DRY
+  value: >
+    -var=subscription_id=$(var-backend-subscription-id)
+    -var=tenant_id=$(var-backend-tenant-id)
+    -var=env=$(env)
+    -out=$(repo)/$(env).tfplan
+- name: serviceConnection # Service Connection used=Managed Identity with Federated Credential. No more secrets!
+  value: azure-federated-account
+
+############
+# DeployTF #
+############
+
+stages:
+- stage: DeployTF
+  jobs:
+  - job: deploy
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+    - script: |
+          plancommandOptions="$(echo -n "$(tfvars)")"
+          if [ "${{ parameters.PlanExecute }}" = "Destroy" ]; then
+            echo "Parameter set to destroy, Appending -destroy to command options for the plan."
+            plancommandOptions="$plancommandOptions -destroy"
+            echo "This pipeline is now designed to DELETE the resources in this repo from Azure."
+          elif [ "${{ parameters.PlanExecute }}" = "Evaluate" ]; then
+            echo "This pipeline is now designed to Evaluate and will only run the plan."
+          else
+            echo "This pipeline is now designed to CREATE the resources in this repo from Azure."
+          fi
+          echo "##vso[task.setvariable variable=dynamicPlanCommandOptions]$plancommandOptions"
+          echo "PLAN COMMAND SET"
+          echo "----------------"
+          echo "terraform plan $plancommandOptions"
+      displayName: 'Pipeline > ${{ parameters.PlanExecute }} run set'
+    - task: TerraformInstaller@1
+      displayName: Terraform Install
+      inputs:
+        terraformVersion: '1.7.2'
+    - task: TerraformCLI@2
+      displayName: Terraform Init
+      inputs:
+        command: 'init'
+        workingDirectory: '$(repo)'
+        commandOptions: '$(initBackendConfigSettings)'
+        backendType: 'azurerm'
+        backendServiceArm: 'azure-federated-account'
+    - task: TerraformCLI@2
+      displayName: Terraform Workspace
+      inputs:
+        command: 'workspace'
+        workingDirectory: '$(repo)'
+        commandOptions: '-or-create'
+        workspaceName: '$(env)'
+    - task: TerraformCLI@2
+      displayName: Terraform Plan
+      inputs:
+        command: 'plan'
+        workingDirectory: '$(repo)'
+        environmentServiceName: 'azure-federated-account'
+        runAzLogin: true
+        commandOptions: '$(dynamicPlanCommandOptions)'
+    - task: TerraformCLI@2
+      condition: and(succeeded(), in('${{ parameters.PlanExecute }}', 'Create', 'Destroy'))
+      displayName: Terraform Apply
+      inputs:
+        command: 'apply'
+        environmentServiceName: 'azure-federated-account'
+        workingDirectory: '$(repo)'
+        runAzLogin: true
+        allowTelemetryCollection: true
+        commandOptions: './$(env).tfplan'
+
+
+
+# READ THIS: https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/guides/service_principal_oidc
+# READ THIS: https://medium.com/@t.costantini89/using-a-worload-identity-federation-authenticated-service-connection-in-azure-devops-to-run-bbd7410c992e

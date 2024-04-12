@@ -1,0 +1,233 @@
+###############
+# Environment #
+###############
+
+# Name of the pipeline runs that get generated
+name: AKS--$(SourceBranchName)--$(Date:yyyyMMdd)$(Rev:.r)--${{ parameters.PlanExecute }}-Job
+
+# How this job is auto triggered:
+trigger:
+  branches:
+    include:
+    - main # when commits are done to main
+  paths:
+    include: # any modification here will trigger it.
+    - 01-Deployment-AKS/TF-Files/*
+    exclude: # Except when these are modified
+    - 01-Deployment-AKS/TF-Files/readme.md
+    - 01-Deployment-AKS/TF-Files/.gitignore
+
+parameters:
+- name: PlanExecute
+  displayName: 'Create, Evaluate or Destroy the resources?'
+  type: string
+  default: 'Evaluate' # Default that the trigger will use, keeping it to validate the plan for testing. Manual runs will be required to create or destroy
+  values: 
+  - Create # TF Apply run against the selected repo
+  - Evaluate # TF Plan run only against the selected repo, wont create artifact either
+  - Destroy # TF Destroy run against the selected repo
+
+variables:
+# Groups
+- group: KvSecrets # Contains client ID & Secert
+- group: Terraform-Backend # Contains Backend Data
+# Individual Variables
+- name: backendkey
+  value: 'aksdeployment/terraform.state'
+- name: env
+  value: 'prod'
+- name: repo
+  value: $(System.DefaultWorkingDirectory)/01-Deployment-AKS/TF-Files
+- name: initBackendConfigSettings # Store terraform init backend config data below to keep code DRY
+  value: >
+    -backend-config=resource_group_name=$(var-backend-resource-group-name)
+    -backend-config=storage_account_name=$(var-backend-storage-account-name)
+    -backend-config=container_name=$(var-backend-container-name)
+    -backend-config=key=$(backendkey)
+    -backend-config=client_id=$(terraformAppClientID)
+    -backend-config=client_secret=$(terraformAppClientSecret)
+    -backend-config=subscription_id=$(var-backend-subscription-id)
+    -backend-config=tenant_id=$(var-backend-tenant-id)
+- name: authNSettings # Store terraform authN variables here that tfplan will ingest to keep code DRY
+  value: >
+    -var=client_id=$(terraformAppClientID)
+    -var=client_secret=$(terraformAppClientSecret)
+    -var=subscription_id=$(var-backend-subscription-id)
+    -var=tenant_id=$(var-backend-tenant-id)
+    -out=$(repo)/$(env).tfplan
+stages:
+
+#########
+# VALIDATE #
+#########
+# Stage to validate TF Files in the repo
+- stage: Validate
+  displayName: Validate Stage
+  jobs:
+  - job: validate
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+  # Install TF
+    - task: TerraformInstaller@0
+      displayName: Install Terraform on Agent
+      inputs:
+        terraformVersion: '1.7.2'
+  # Init and Validate cmd run. Note we dont have to use a task, we can just run the cmds in a script.
+  # This example will init without a backend as we are testing the files themselves not connecting to Azure
+    - script: |
+        terraform init -backend=false &>/dev/null
+        terraform validate
+      displayName: 'Terraform Validate'
+      workingDirectory: '$(repo)'
+
+#########
+# BUILD #
+#########
+# Stage to build artifact (tfplan file)
+- stage: Build
+  displayName: Build Stage
+  jobs:
+  - job: build
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+  # Install TF
+    - task: TerraformInstaller@0
+      displayName: Install Terraform on Agent
+      inputs:
+        terraformVersion: '1.7.2'
+  # Initialize TF using the backendconfig variable
+    - task: TerraformCLI@0
+      displayName: Terraform Init
+      inputs:
+        command: 'init'
+        workingDirectory: '$(repo)'
+        commandOptions: '$(initBackendConfigSettings)'
+        backendType: 'selfConfigured'
+  # As the command option for plan may or may not have destroy. We will add the authN values and decide if we want to add destroy flag or not based on the parameter
+  # note the echo command ##vso, it is creating a new variable in ADO (vso) that will exist in the pipelines for us to use (but only in this stage) for tf plan cmd later
+    - script: |
+          plancommandOptions="$(echo -n "$(authNSettings)")"
+          if [ "${{ parameters.PlanExecute }}" = "Destroy" ]; then
+            echo "Parameter set to destroy, Appending -destroy to command options for the plan."
+            plancommandOptions="$plancommandOptions -destroy"
+            echo "This pipeline is now designed to DELETE the resources in this repo from Azure."
+          elif [ "${{ parameters.PlanExecute }}" = "Evaluate" ]; then
+            echo "This pipeline is now designed to Evaluate and will only run the plan."
+          else
+            echo "This pipeline is now designed to CREATE the resources in this repo from Azure."
+          fi
+          echo "##vso[task.setvariable variable=dynamicPlanCommandOptions]$plancommandOptions"
+          echo "PLAN COMMAND SET"
+          echo "----------------"
+          echo "terraform plan $plancommandOptions"
+      displayName: 'Pipeline > ${{ parameters.PlanExecute }} run set'
+  # Create TF Plan
+    - task: TerraformCLI@0
+      displayName: Terraform Plan
+      inputs:
+        command: 'plan'
+        workingDirectory: '$(repo)'
+        commandOptions: $(dynamicPlanCommandOptions)
+  # Create Artifact
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(repo)/$(env).tfplan'
+        artifact: "planArtifact"
+      condition: and(succeeded(), ne('${{ parameters.PlanExecute }}', 'Plan'))
+
+###########
+# APPROVE #
+###########
+# This stage is only used for approval. No steps are needed here as the next one will process
+# Just make sure you have an environment created for approval
+
+- stage: Approval
+  condition: and(succeeded('Build'), in('${{ parameters.PlanExecute }}', 'Create', 'Destroy'))
+  displayName: 'Approval Stage'
+  jobs:
+  - deployment: approval
+    environment: 'Apply'
+
+##########
+# DEPLOY #
+##########
+# Stage for Deployment in to Azure, ingesting the tfplan Artifact which could be either to create or destroy the services
+- stage: Deploy
+  condition: succeeded('Approval')
+  displayName: 'Deploy Stage'
+  jobs:
+  - job: deploy
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+  # Download Plan file artifact for new job
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        buildType: 'current'
+        artifactName: 'planArtifact'
+        targetPath: '$(Pipeline.Workspace)'
+    - task: CmdLine@2
+      inputs:
+        script: |
+          echo "Listing contents of $(Pipeline.Workspace)"
+          ls -la $(Pipeline.Workspace)
+  # Install TF
+    - task: TerraformInstaller@0
+      displayName: Install Terraform
+      inputs:
+        terraformVersion: '1.7.2'
+  # Initialize TF
+    - task: TerraformCLI@0
+      displayName: Terraform Init
+      inputs:
+        command: 'init'
+        workingDirectory: '$(repo)'
+        commandOptions: '$(initBackendConfigSettings)' # using variable instead
+        backendType: 'selfConfigured'
+  # Apply TF
+    - task: TerraformCLI@0
+      displayName: Terraform Apply
+      inputs:
+        command: 'apply'
+        workingDirectory: '$(repo)'
+        commandOptions: '$(Pipeline.Workspace)/$(env).tfplan'
+  # Save Outputs to file
+    - script: |
+        terraform output -json > $(repo)/$(env)output.json
+      displayName: 'Save Output to File'
+      workingDirectory: '$(repo)'
+  # Build Artifact for output
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(repo)/$(env)output.json'
+        artifact: "outputArtifact"
+      condition: succeeded()
+
+###################
+# Post Deployment #
+###################
+# Just includes TF output in a file in JSON. Could be ingested in a second pipeline for further deploying of the resources
+- stage: PostDeployment
+  condition: not(or(failed(), canceled())) # Allow if previous stages where succeeded or skipped but not failed or cancelled
+  displayName: 'Post Deployment Stage'
+  jobs:
+  - job: post
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: DownloadPipelineArtifact@2
+      condition: eq('${{ parameters.PlanExecute }}', 'Create')
+      inputs:
+        buildType: 'current'
+        artifactName: 'outputArtifact'
+        targetPath: '$(Pipeline.Workspace)'
+    # output file artifact
+    - script: |
+        cat $(Pipeline.Workspace)/$(env)output.json
+      displayName: 'Outputs'
+      condition: eq('${{ parameters.PlanExecute }}', 'Create')
+      workingDirectory: '$(repo)'
